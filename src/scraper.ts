@@ -53,8 +53,13 @@ import {
   retweet,
   createCreateNoteTweetRequest,
   createCreateLongTweetRequest,
+  getArticle,
 } from './tweets';
-import { parseTimelineTweetsV2, TimelineV2 } from './timeline-v2';
+import {
+  parseTimelineTweetsV2,
+  TimelineArticle,
+  TimelineV2,
+} from './timeline-v2';
 import { fetchHomeTimeline } from './timeline-home';
 import { fetchFollowingTimeline } from './timeline-following';
 import {
@@ -75,9 +80,23 @@ import {
   fetchAudioSpaceById,
   fetchAuthenticatePeriscope,
   fetchBrowseSpaceTopics,
-  fetchCommunitySelectQuery, fetchLiveVideoStreamStatus, fetchLoginTwitterToken
+  fetchCommunitySelectQuery,
+  fetchLiveVideoStreamStatus,
+  fetchLoginTwitterToken,
 } from './spaces';
-import {AudioSpace, Community, LiveVideoStreamStatus, LoginTwitterTokenResponse, Subtopic} from './types/spaces';
+import {
+  AudioSpace,
+  Community,
+  LiveVideoStreamStatus,
+  LoginTwitterTokenResponse,
+  Subtopic,
+} from './types/spaces';
+import {
+  createGrokConversation,
+  grokChat,
+  GrokChatOptions,
+  GrokChatResponse,
+} from './grok';
 
 const twUrl = 'https://twitter.com';
 const UserTweetsUrl =
@@ -461,12 +480,14 @@ export class Scraper {
     text: string,
     replyToTweetId?: string,
     mediaData?: { data: Buffer; mediaType: string }[],
+    hideLinkPreview?: boolean,
   ) {
     return await createCreateTweetRequest(
       text,
       this.auth,
       replyToTweetId,
       mediaData,
+      hideLinkPreview,
     );
   }
 
@@ -945,7 +966,7 @@ export class Scraper {
    * @returns The status of the Audio Space stream.
    */
   public async getAudioSpaceStreamStatus(
-      mediaKey: string,
+    mediaKey: string,
   ): Promise<LiveVideoStreamStatus> {
     return await fetchLiveVideoStreamStatus(mediaKey, this.auth);
   }
@@ -958,7 +979,7 @@ export class Scraper {
    * @returns The status of the Audio Space stream.
    */
   public async getAudioSpaceStatus(
-      audioSpaceId: string,
+    audioSpaceId: string,
   ): Promise<LiveVideoStreamStatus> {
     const audioSpace = await this.getAudioSpaceById(audioSpaceId);
 
@@ -984,7 +1005,7 @@ export class Scraper {
    * @returns The response containing the cookie and user information.
    */
   public async loginTwitterToken(
-      jwt: string,
+    jwt: string,
   ): Promise<LoginTwitterTokenResponse> {
     return await fetchLoginTwitterToken(jwt, this.auth);
   }
@@ -998,5 +1019,35 @@ export class Scraper {
     const loginResponse = await this.loginTwitterToken(periscopeToken);
 
     return loginResponse.cookie;
+  }
+
+  /**
+   * Fetches a article (long form tweet) by its ID.
+   * @param id The ID of the article to fetch. In the format of (http://x.com/i/article/id)
+   * @returns The {@link TimelineArticle} object, or `null` if it couldn't be fetched.
+   */
+  public getArticle(id: string): Promise<TimelineArticle | null> {
+    return getArticle(id, this.auth);
+  }
+
+  /**
+   * Creates a new conversation with Grok.
+   * @returns A promise that resolves to the conversation ID string.
+   */
+  public async createGrokConversation(): Promise<string> {
+    return await createGrokConversation(this.auth);
+  }
+
+  /**
+   * Interact with Grok in a chat-like manner.
+   * @param options The options for the Grok chat interaction.
+   * @param {GrokMessage[]} options.messages - Array of messages in the conversation.
+   * @param {string} [options.conversationId] - Optional ID of an existing conversation.
+   * @param {boolean} [options.returnSearchResults] - Whether to return search results.
+   * @param {boolean} [options.returnCitations] - Whether to return citations.
+   * @returns A promise that resolves to the Grok chat response.
+   */
+  public async grokChat(options: GrokChatOptions): Promise<GrokChatResponse> {
+    return await grokChat(options, this.auth);
   }
 }

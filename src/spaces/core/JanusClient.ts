@@ -3,34 +3,77 @@
 import { EventEmitter } from 'events';
 import wrtc from '@roamhq/wrtc';
 const { RTCPeerConnection, MediaStream } = wrtc;
-import { JanusAudioSink, JanusAudioSource } from './JanusAudioSource';
+import { JanusAudioSink, JanusAudioSource } from './JanusAudio';
 import type { AudioDataWithUser, TurnServersInfo } from '../types';
+import { Logger } from '../logger';
 
 interface JanusConfig {
+  /**
+   * The base URL for the Janus gateway (e.g. "https://gw-prod-hydra-eu-west-3.pscp.tv/s=prod:XX/v1/gateway")
+   */
   webrtcUrl: string;
+
+  /**
+   * The unique room ID (e.g., the broadcast or space ID)
+   */
   roomId: string;
+
+  /**
+   * The token/credential used to authorize requests to Janus (often a signed JWT).
+   */
   credential: string;
+
+  /**
+   * The user identifier (host or speaker). Used as 'display' in the Janus plugin.
+   */
   userId: string;
+
+  /**
+   * The name of the stream (often the same as roomId for convenience).
+   */
   streamName: string;
+
+  /**
+   * ICE / TURN server information returned by Twitter's /turnServers endpoint.
+   */
   turnServers: TurnServersInfo;
+
+  /**
+   * Logger instance for consistent debug/info/error logs.
+   */
+  logger: Logger;
 }
 
 /**
- * This class is in charge of the Janus session, handle,
- * joining the videoroom, and polling events.
+ * Manages the Janus session for a Twitter AudioSpace:
+ *  - Creates a Janus session and plugin handle
+ *  - Joins the Janus videoroom as publisher/subscriber
+ *  - Subscribes to other speakers
+ *  - Sends local PCM frames as Opus
+ *  - Polls for Janus events
+ *
+ * It can be used by both the host (who creates a room) or a guest speaker (who joins an existing room).
  */
 export class JanusClient extends EventEmitter {
+  private logger: Logger;
+
   private sessionId?: number;
   private handleId?: number;
   private publisherId?: number;
+
   private pc?: RTCPeerConnection;
   private localAudioSource?: JanusAudioSource;
+
   private pollActive = false;
+
+  // Tracks promises waiting for specific Janus events
   private eventWaiters: Array<{
     predicate: (evt: any) => boolean;
     resolve: (value: any) => void;
     reject: (error: Error) => void;
   }> = [];
+
+  // Tracks subscriber handle+pc for each userId we subscribe to
   private subscribers = new Map<
     string,
     {
@@ -41,26 +84,34 @@ export class JanusClient extends EventEmitter {
 
   constructor(private readonly config: JanusConfig) {
     super();
+    this.logger = config.logger;
   }
 
-  async initialize() {
-    // 1) Create session
-    this.sessionId = await this.createSession();
+  /**
+   * Initializes this JanusClient for the host scenario:
+   *  1) createSession()
+   *  2) attachPlugin()
+   *  3) createRoom()
+   *  4) joinRoom()
+   *  5) configure local PeerConnection (send audio, etc.)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.debug('[JanusClient] initialize() called');
 
-    // 2) Attach plugin
+    this.sessionId = await this.createSession();
     this.handleId = await this.attachPlugin();
 
-    // 3) Start polling events right now
+    // Start polling for Janus events
     this.pollActive = true;
     this.startPolling();
 
-    // 4) Create room
+    // Create a new Janus room (only for the host scenario)
     await this.createRoom();
 
-    // 3) Join room
+    // Join that room as publisher
     this.publisherId = await this.joinRoom();
 
-    // 4) Create local RTCPeerConnection
+    // Set up our RTCPeerConnection for local audio
     this.pc = new RTCPeerConnection({
       iceServers: [
         {
@@ -72,50 +123,134 @@ export class JanusClient extends EventEmitter {
     });
     this.setupPeerEvents();
 
+    // Add local audio track
     this.enableLocalAudio();
-    // 6) Do the initial configure -> generate Offer -> setLocalDesc -> send -> setRemoteDesc
+
+    // Create an offer and configure the publisher in Janus
     await this.configurePublisher();
 
-    console.log('[JanusClient] Initialization complete');
+    this.logger.info('[JanusClient] Initialization complete');
   }
 
-  public async subscribeSpeaker(userId: string): Promise<void> {
-    console.log('[JanusClient] subscribeSpeaker => userId=', userId);
+  /**
+   * Initializes this JanusClient for a guest speaker scenario:
+   *  1) createSession()
+   *  2) attachPlugin()
+   *  3) join existing room as publisher (no createRoom call)
+   *  4) configure local PeerConnection
+   *  5) subscribe to any existing publishers
+   */
+  public async initializeGuestSpeaker(sessionUUID: string): Promise<void> {
+    this.logger.debug('[JanusClient] initializeGuestSpeaker() called');
 
-    // 1) Attach plugin as subscriber
-    const subscriberHandleId = await this.attachPlugin();
-    console.log('[JanusClient] subscriber handle =>', subscriberHandleId);
+    // 1) Create a new Janus session
+    this.sessionId = await this.createSession();
+    this.handleId = await this.attachPlugin();
 
-    // 2) Wait for an event with "publishers" to discover feedId
-    //    We do *not* check sender === subscriberHandleId because Hydra
-    //    might send it from the main handle or another handle.
-    const publishersEvt = await this.waitForJanusEvent(
+    // Start polling
+    this.pollActive = true;
+    this.startPolling();
+
+    // 2) Join the existing room as a publisher (no createRoom)
+    const evtPromise = this.waitForJanusEvent(
       (e) =>
         e.janus === 'event' &&
         e.plugindata?.plugin === 'janus.plugin.videoroom' &&
-        e.plugindata?.data?.videoroom === 'event' &&
-        Array.isArray(e.plugindata?.data?.publishers) &&
-        e.plugindata?.data?.publishers.length > 0,
-      8000,
-      'discover feed_id from "publishers"',
+        e.plugindata?.data?.videoroom === 'joined',
+      10000,
+      'Guest Speaker joined event',
     );
 
-    // Extract the feedId from the first publisher whose 'display' or 'periscope_user_id' = userId
-    // (in your logs, 'display' or 'periscope_user_id' is the actual user)
-    const list = publishersEvt.plugindata.data.publishers as any[];
-    const pub = list.find(
-      (p) => p.display === userId || p.periscope_user_id === userId,
+    const body = {
+      request: 'join',
+      room: this.config.roomId,
+      ptype: 'publisher',
+      display: this.config.userId,
+      periscope_user_id: this.config.userId,
+    };
+    await this.sendJanusMessage(this.handleId, body);
+
+    // Wait for the joined event
+    const evt = await evtPromise;
+    const data = evt.plugindata?.data;
+    this.publisherId = data.id; // Our own publisherId
+    this.logger.debug(
+      '[JanusClient] guest joined => publisherId=',
+      this.publisherId,
     );
-    if (!pub) {
-      throw new Error(
-        `[JanusClient] subscribeSpeaker => No publisher found for userId=${userId}`,
+
+    // If there are existing publishers, we can subscribe to them
+    const publishers = data.publishers || [];
+    this.logger.debug('[JanusClient] existing publishers =>', publishers);
+
+    // 3) Create RTCPeerConnection for sending local audio
+    this.pc = new RTCPeerConnection({
+      iceServers: [
+        {
+          urls: this.config.turnServers.uris,
+          username: this.config.turnServers.username,
+          credential: this.config.turnServers.password,
+        },
+      ],
+    });
+    this.setupPeerEvents();
+    this.enableLocalAudio();
+
+    // 4) configurePublisher => generate offer, wait for answer
+    await this.configurePublisher(sessionUUID);
+
+    // 5) Subscribe to each existing publisher
+    await Promise.all(
+      publishers.map((pub: any) => this.subscribeSpeaker(pub.display, pub.id)),
+    );
+
+    this.logger.info('[JanusClient] Guest speaker negotiation complete');
+  }
+
+  /**
+   * Subscribes to a speaker's audio feed by userId and/or feedId.
+   * If feedId=0, we wait for a "publishers" event to discover feedId.
+   */
+  public async subscribeSpeaker(
+    userId: string,
+    feedId: number = 0,
+  ): Promise<void> {
+    this.logger.debug('[JanusClient] subscribeSpeaker => userId=', userId);
+
+    // 1) Attach a separate plugin handle for subscriber
+    const subscriberHandleId = await this.attachPlugin();
+    this.logger.debug('[JanusClient] subscriber handle =>', subscriberHandleId);
+
+    // If feedId was not provided, wait for an event listing publishers
+    if (feedId === 0) {
+      const publishersEvt = await this.waitForJanusEvent(
+        (e) =>
+          e.janus === 'event' &&
+          e.plugindata?.plugin === 'janus.plugin.videoroom' &&
+          e.plugindata?.data?.videoroom === 'event' &&
+          Array.isArray(e.plugindata?.data?.publishers) &&
+          e.plugindata?.data?.publishers.length > 0,
+        8000,
+        'discover feed_id from "publishers"',
       );
+
+      const list = publishersEvt.plugindata.data.publishers as any[];
+      const pub = list.find(
+        (p) => p.display === userId || p.periscope_user_id === userId,
+      );
+      if (!pub) {
+        throw new Error(
+          `[JanusClient] subscribeSpeaker => No publisher found for userId=${userId}`,
+        );
+      }
+      feedId = pub.id;
+      this.logger.debug('[JanusClient] found feedId =>', feedId);
     }
-    const feedId = pub.id;
-    console.log('[JanusClient] found feedId =>', feedId);
+
+    // Notify listeners that we've discovered a feed
     this.emit('subscribedSpeaker', { userId, feedId });
 
-    // 3) "join" as subscriber with "streams: [{ feed, mid: '0', send: true }]"
+    // 2) Join the room as a "subscriber"
     const joinBody = {
       request: 'join',
       room: this.config.roomId,
@@ -125,14 +260,13 @@ export class JanusClient extends EventEmitter {
         {
           feed: feedId,
           mid: '0',
-          send: true,
+          send: true, // indicates we might send audio?
         },
       ],
     };
     await this.sendJanusMessage(subscriberHandleId, joinBody);
 
-    // 4) Wait for "attached" + jsep.offer from *this subscriber handle*
-    //    Now we do filter on e.sender === subscriberHandleId
+    // 3) Wait for "attached" + jsep.offer
     const attachedEvt = await this.waitForJanusEvent(
       (e) =>
         e.janus === 'event' &&
@@ -143,11 +277,10 @@ export class JanusClient extends EventEmitter {
       8000,
       'subscriber attached + offer',
     );
-    console.log('[JanusClient] subscriber => "attached" with offer');
+    this.logger.debug('[JanusClient] subscriber => "attached" with offer');
 
+    // 4) Create a new RTCPeerConnection for receiving audio from this feed
     const offer = attachedEvt.jsep;
-
-    // 5) Create subPc, setRemoteDescription(offer), createAnswer, setLocalDescription(answer)
     const subPc = new RTCPeerConnection({
       iceServers: [
         {
@@ -158,42 +291,28 @@ export class JanusClient extends EventEmitter {
       ],
     });
 
-    // Ontrack => parse PCM via JanusAudioSink
     subPc.ontrack = (evt) => {
-      console.log('[JanusClient] subscriber track =>', evt.track.kind);
+      this.logger.debug(
+        '[JanusClient] subscriber track => kind=%s, readyState=%s, muted=%s',
+        evt.track.kind,
+        evt.track.readyState,
+        evt.track.muted,
+      );
+      // Attach a JanusAudioSink to capture PCM
+      const sink = new JanusAudioSink(evt.track, { logger: this.logger });
 
-      // TODO: REMOVE DEBUG
-      // console.log(
-      //   '[JanusClient] subscriber track => kind=',
-      //   evt.track.kind,
-      //   'readyState=',
-      //   evt.track.readyState,
-      //   'muted=',
-      //   evt.track.muted,
-      // );
-
-      const sink = new JanusAudioSink(evt.track);
+      // For each audio frame, forward it to 'audioDataFromSpeaker'
       sink.on('audioData', (frame) => {
-        // TODO: REMOVE DEBUG
-        // console.log(
-        //   '[AudioSink] got an audio frame => sampleRate=',
-        //   frame.sampleRate,
-        //   'length=',
-        //   frame.samples.length,
-        // );
-        // console.log(
-        //   '[AudioSink] sampleRate=',
-        //   frame.sampleRate,
-        //   'channels=',
-        //   frame.channelCount,
-        // );
-        // const { samples } = frame; // Int16Array
-        // let maxVal = 0;
-        // for (let i = 0; i < samples.length; i++) {
-        //   const val = Math.abs(samples[i]);
-        //   if (val > maxVal) maxVal = val;
-        // }
-        // console.log(`[AudioSink] userId=${userId}, maxAmplitude=${maxVal}`);
+        if (this.logger.isDebugEnabled()) {
+          let maxVal = 0;
+          for (let i = 0; i < frame.samples.length; i++) {
+            const val = Math.abs(frame.samples[i]);
+            if (val > maxVal) maxVal = val;
+          }
+          this.logger.debug(
+            `[AudioSink] userId=${userId}, maxAmplitude=${maxVal}`,
+          );
+        }
 
         this.emit('audioDataFromSpeaker', {
           userId,
@@ -206,11 +325,12 @@ export class JanusClient extends EventEmitter {
       });
     };
 
+    // 5) Answer the subscription offer
     await subPc.setRemoteDescription(offer);
     const answer = await subPc.createAnswer();
     await subPc.setLocalDescription(answer);
 
-    // 6) Send "start" with jsep=answer
+    // 6) Send "start" request to begin receiving
     await this.sendJanusMessage(
       subscriberHandleId,
       {
@@ -220,59 +340,83 @@ export class JanusClient extends EventEmitter {
       },
       answer,
     );
-    console.log('[JanusClient] subscriber => done (user=', userId, ')');
 
-    // Store for potential cleanup
+    this.logger.debug('[JanusClient] subscriber => done (user=', userId, ')');
+
+    // Track this subscription handle+pc by userId
     this.subscribers.set(userId, { handleId: subscriberHandleId, pc: subPc });
   }
 
-  pushLocalAudio(samples: Int16Array, sampleRate: number, channels = 1) {
+  /**
+   * Pushes local PCM frames to Janus. If the localAudioSource isn't active, it enables it.
+   */
+  public pushLocalAudio(samples: Int16Array, sampleRate: number, channels = 1) {
     if (!this.localAudioSource) {
-      console.warn('[JanusClient] No localAudioSource; enabling now...');
+      this.logger.warn('[JanusClient] No localAudioSource => enabling now...');
       this.enableLocalAudio();
     }
     this.localAudioSource?.pushPcmData(samples, sampleRate, channels);
   }
 
-  enableLocalAudio() {
+  /**
+   * Ensures a local audio track is added to the RTCPeerConnection for publishing.
+   */
+  public enableLocalAudio(): void {
     if (!this.pc) {
-      console.warn('[JanusClient] No RTCPeerConnection');
+      this.logger.warn(
+        '[JanusClient] enableLocalAudio => No RTCPeerConnection',
+      );
       return;
     }
     if (this.localAudioSource) {
-      console.log('[JanusClient] localAudioSource already active');
+      this.logger.debug('[JanusClient] localAudioSource already active');
       return;
     }
-    this.localAudioSource = new JanusAudioSource();
+    // Create a JanusAudioSource that feeds PCM frames
+    this.localAudioSource = new JanusAudioSource({ logger: this.logger });
     const track = this.localAudioSource.getTrack();
     const localStream = new MediaStream();
     localStream.addTrack(track);
     this.pc.addTrack(track, localStream);
   }
 
-  async stop() {
-    console.log('[JanusClient] Stopping...');
+  /**
+   * Stops the Janus client: ends polling, closes the RTCPeerConnection, etc.
+   * Does not destroy or leave the room automatically; call destroyRoom() or leaveRoom() if needed.
+   */
+  public async stop(): Promise<void> {
+    this.logger.info('[JanusClient] Stopping...');
     this.pollActive = false;
-    // leave the room, etc.
-    // close PC
     if (this.pc) {
       this.pc.close();
       this.pc = undefined;
     }
   }
 
-  getSessionId() {
+  /**
+   * Returns the current Janus sessionId, if any.
+   */
+  public getSessionId(): number | undefined {
     return this.sessionId;
   }
-  getHandleId() {
+
+  /**
+   * Returns the Janus handleId for the publisher, if any.
+   */
+  public getHandleId(): number | undefined {
     return this.handleId;
   }
-  getPublisherId() {
+
+  /**
+   * Returns the Janus publisherId (internal participant ID), if any.
+   */
+  public getPublisherId(): number | undefined {
     return this.publisherId;
   }
 
-  // ------------------- Private Methods --------------------
-
+  /**
+   * Creates a new Janus session via POST /janus (with "janus":"create").
+   */
   private async createSession(): Promise<number> {
     const transaction = this.randomTid();
     const resp = await fetch(this.config.webrtcUrl, {
@@ -287,16 +431,23 @@ export class JanusClient extends EventEmitter {
         transaction,
       }),
     });
-    if (!resp.ok) throw new Error('[JanusClient] createSession failed');
+    if (!resp.ok) {
+      throw new Error('[JanusClient] createSession failed');
+    }
     const json = await resp.json();
-    if (json.janus !== 'success')
+    if (json.janus !== 'success') {
       throw new Error('[JanusClient] createSession invalid response');
-    return json.data.id; // sessionId
+    }
+    return json.data.id;
   }
 
+  /**
+   * Attaches to the videoroom plugin via /janus/{sessionId} (with "janus":"attach").
+   */
   private async attachPlugin(): Promise<number> {
-    if (!this.sessionId) throw new Error('[JanusClient] no sessionId');
-
+    if (!this.sessionId) {
+      throw new Error('[JanusClient] attachPlugin => no sessionId');
+    }
     const transaction = this.randomTid();
     const resp = await fetch(`${this.config.webrtcUrl}/${this.sessionId}`, {
       method: 'POST',
@@ -310,18 +461,24 @@ export class JanusClient extends EventEmitter {
         transaction,
       }),
     });
-    if (!resp.ok) throw new Error('[JanusClient] attachPlugin failed');
+    if (!resp.ok) {
+      throw new Error('[JanusClient] attachPlugin failed');
+    }
     const json = await resp.json();
-    if (json.janus !== 'success')
+    if (json.janus !== 'success') {
       throw new Error('[JanusClient] attachPlugin invalid response');
+    }
     return json.data.id;
   }
 
-  private async createRoom() {
+  /**
+   * Creates a Janus room for the host scenario.
+   * For a guest, this step is skipped (the room already exists).
+   */
+  private async createRoom(): Promise<void> {
     if (!this.sessionId || !this.handleId) {
-      throw new Error('[JanusClient] No session/handle');
+      throw new Error('[JanusClient] createRoom => No session/handle');
     }
-
     const transaction = this.randomTid();
     const body = {
       request: 'create',
@@ -334,8 +491,6 @@ export class JanusClient extends EventEmitter {
       h264_profile: '42e01f',
       dummy_publisher: false,
     };
-
-    // Send the "create" request
     const resp = await fetch(
       `${this.config.webrtcUrl}/${this.sessionId}/${this.handleId}`,
       {
@@ -352,23 +507,17 @@ export class JanusClient extends EventEmitter {
         }),
       },
     );
-
     if (!resp.ok) {
       throw new Error(`[JanusClient] createRoom failed => ${resp.status}`);
     }
-
     const json = await resp.json();
-    console.log('[JanusClient] createRoom =>', JSON.stringify(json));
+    this.logger.debug('[JanusClient] createRoom =>', JSON.stringify(json));
 
-    // Check if Janus responded with videoroom:"created"
     if (json.janus === 'error') {
       throw new Error(
-        `[JanusClient] createRoom error => ${
-          json.error?.reason || 'Unknown error'
-        }`,
+        `[JanusClient] createRoom error => ${json.error?.reason || 'Unknown'}`,
       );
     }
-
     if (json.plugindata?.data?.videoroom !== 'created') {
       throw new Error(
         `[JanusClient] unexpected createRoom response => ${JSON.stringify(
@@ -376,26 +525,27 @@ export class JanusClient extends EventEmitter {
         )}`,
       );
     }
-
-    console.log(
+    this.logger.debug(
       `[JanusClient] Room '${this.config.roomId}' created successfully`,
     );
   }
 
+  /**
+   * Joins the created room as a publisher, for the host scenario.
+   */
   private async joinRoom(): Promise<number> {
-    if (!this.sessionId || !this.handleId)
-      throw new Error('[JanusClient] no session/handle');
+    if (!this.sessionId || !this.handleId) {
+      throw new Error('[JanusClient] no session/handle for joinRoom()');
+    }
 
-    // Wait for the event that indicates we joined
-    // Typically:  evt.janus === 'event' && evt.plugindata?.data?.videoroom === 'joined'
+    this.logger.debug('[JanusClient] joinRoom => start');
+
+    // Wait for the 'joined' event from videoroom
     const evtPromise = this.waitForJanusEvent(
-      (e) => {
-        return (
-          e.janus === 'event' &&
-          e.plugindata?.plugin === 'janus.plugin.videoroom' &&
-          e.plugindata?.data?.videoroom === 'joined'
-        );
-      },
+      (e) =>
+        e.janus === 'event' &&
+        e.plugindata?.plugin === 'janus.plugin.videoroom' &&
+        e.plugindata?.data?.videoroom === 'joined',
       12000,
       'Host Joined Event',
     );
@@ -410,51 +560,55 @@ export class JanusClient extends EventEmitter {
     await this.sendJanusMessage(this.handleId, body);
 
     const evt = await evtPromise;
-
     const publisherId = evt.plugindata.data.id;
-    console.log('[JanusClient] joined room => publisherId=', publisherId);
+    this.logger.debug('[JanusClient] joined room => publisherId=', publisherId);
     return publisherId;
   }
 
-  private async configurePublisher() {
-    if (!this.pc || !this.sessionId || !this.handleId) return;
+  /**
+   * Creates an SDP offer and sends "configure" to Janus with it.
+   * Used by both host and guest after attach + join.
+   */
+  private async configurePublisher(sessionUUID: string = ''): Promise<void> {
+    if (!this.pc || !this.sessionId || !this.handleId) {
+      return;
+    }
 
-    console.log('[JanusClient] createOffer...');
+    this.logger.debug('[JanusClient] createOffer...');
     const offer = await this.pc.createOffer({
       offerToReceiveAudio: true,
       offerToReceiveVideo: false,
     });
     await this.pc.setLocalDescription(offer);
 
-    console.log('[JanusClient] sending configure with JSEP...');
+    this.logger.debug('[JanusClient] sending configure with JSEP...');
     await this.sendJanusMessage(
       this.handleId,
       {
         request: 'configure',
         room: this.config.roomId,
         periscope_user_id: this.config.userId,
-        session_uuid: '',
+        session_uuid: sessionUUID,
         stream_name: this.config.streamName,
         vidman_token: this.config.credential,
       },
       offer,
     );
-
-    console.log('[JanusClient] waiting for answer...');
-    // In a real scenario, we do an event-based wait for jsep.type === 'answer'.
-    // For MVP, let's do a poll in handleJanusEvent for that "answer" and setRemoteDesc
+    this.logger.debug('[JanusClient] waiting for answer...');
   }
 
+  /**
+   * Sends a "janus":"message" to the Janus handle, optionally with jsep.
+   */
   private async sendJanusMessage(
     handleId: number,
     body: any,
     jsep?: any,
   ): Promise<void> {
     if (!this.sessionId) {
-      throw new Error('[JanusClient] No session');
+      throw new Error('[JanusClient] No session for sendJanusMessage');
     }
     const transaction = this.randomTid();
-
     const resp = await fetch(
       `${this.config.webrtcUrl}/${this.sessionId}/${handleId}`,
       {
@@ -471,19 +625,21 @@ export class JanusClient extends EventEmitter {
         }),
       },
     );
-
     if (!resp.ok) {
       throw new Error(
-        '[JanusClient] sendJanusMessage failed => ' + resp.status,
+        `[JanusClient] sendJanusMessage failed => status=${resp.status}`,
       );
     }
   }
 
-  private startPolling() {
-    console.log('[JanusClient] Starting polling...');
+  /**
+   * Starts polling /janus/{sessionId}?maxev=1 for events. We parse keepalives, answers, etc.
+   */
+  private startPolling(): void {
+    this.logger.debug('[JanusClient] Starting polling...');
     const doPoll = async () => {
       if (!this.pollActive || !this.sessionId) {
-        console.log('[JanusClient] Polling stopped');
+        this.logger.debug('[JanusClient] Polling stopped');
         return;
       }
       try {
@@ -497,82 +653,97 @@ export class JanusClient extends EventEmitter {
           const event = await resp.json();
           this.handleJanusEvent(event);
         } else {
-          console.log('[JanusClient] poll error =>', resp.status);
+          this.logger.warn('[JanusClient] poll error =>', resp.status);
         }
       } catch (err) {
-        console.error('[JanusClient] poll exception =>', err);
+        this.logger.error('[JanusClient] poll exception =>', err);
       }
       setTimeout(doPoll, 500);
     };
     doPoll();
   }
 
-  private handleJanusEvent(evt: any) {
-    // TODO: REMOVE DEBUG
-    // console.log('[JanusClient] handleJanusEvent =>', JSON.stringify(evt));
-
-    if (!evt.janus) return;
+  /**
+   * Processes each Janus event received from the poll cycle.
+   */
+  private handleJanusEvent(evt: any): void {
+    if (!evt.janus) {
+      return;
+    }
     if (evt.janus === 'keepalive') {
+      this.logger.debug('[JanusClient] keepalive received');
       return;
     }
     if (evt.janus === 'webrtcup') {
-      console.log('[JanusClient] webrtcup =>', evt.sender);
+      this.logger.debug('[JanusClient] webrtcup => sender=', evt.sender);
     }
+    // If there's a JSEP answer, set it on our RTCPeerConnection
     if (evt.jsep && evt.jsep.type === 'answer') {
       this.onReceivedAnswer(evt.jsep);
     }
+    // If there's a publisherId in the data, store it
     if (evt.plugindata?.data?.id) {
-      // e.g. publisherId
       this.publisherId = evt.plugindata.data.id;
     }
+    // If there's an error, emit an 'error' event
     if (evt.error) {
-      console.error('[JanusClient] Janus error =>', evt.error.reason);
+      this.logger.error('[JanusClient] Janus error =>', evt.error.reason);
       this.emit('error', new Error(evt.error.reason));
     }
 
+    // Resolve any waiting eventWaiters whose predicate matches
     for (let i = 0; i < this.eventWaiters.length; i++) {
       const waiter = this.eventWaiters[i];
       if (waiter.predicate(evt)) {
-        // remove from the array
         this.eventWaiters.splice(i, 1);
-        // resolve the promise
         waiter.resolve(evt);
-        break; // important: only resolve one waiter
+        break;
       }
     }
-    // Add more logic if needed
   }
 
-  private async onReceivedAnswer(answer: any) {
-    if (!this.pc) return;
-    console.log('[JanusClient] got answer => setRemoteDescription');
+  /**
+   * Called whenever we get an SDP "answer" from Janus. Sets the remote description on our PC.
+   */
+  private async onReceivedAnswer(answer: any): Promise<void> {
+    if (!this.pc) {
+      return;
+    }
+    this.logger.debug('[JanusClient] got answer => setRemoteDescription');
     await this.pc.setRemoteDescription(answer);
   }
 
-  private setupPeerEvents() {
-    if (!this.pc) return;
-
+  /**
+   * Sets up events on our main RTCPeerConnection for ICE changes, track additions, etc.
+   */
+  private setupPeerEvents(): void {
+    if (!this.pc) {
+      return;
+    }
     this.pc.addEventListener('iceconnectionstatechange', () => {
-      // TODO: REMOVE DEBUG
-      // console.log('[JanusClient] ICE state =>', this.pc?.iceConnectionState);
-
+      this.logger.debug(
+        '[JanusClient] ICE state =>',
+        this.pc?.iceConnectionState,
+      );
       if (this.pc?.iceConnectionState === 'failed') {
-        this.emit('error', new Error('ICE connection failed'));
+        this.emit('error', new Error('[JanusClient] ICE connection failed'));
       }
     });
-
     this.pc.addEventListener('track', (evt) => {
-      console.log('[JanusClient] track =>', evt.track.kind);
-      // Here you can attach a JanusAudioSink to parse PCM frames
+      this.logger.debug('[JanusClient] ontrack => kind=', evt.track.kind);
     });
   }
 
-  private randomTid() {
+  /**
+   * Generates a random transaction ID for Janus requests.
+   */
+  private randomTid(): string {
     return Math.random().toString(36).slice(2, 10);
   }
 
   /**
-   * Allows code to wait for a specific Janus event that matches a predicate
+   * Waits for a specific Janus event (e.g., "joined", "attached", etc.)
+   * that matches a given predicate. Times out after timeoutMs if not received.
    */
   private async waitForJanusEvent(
     predicate: (evt: any) => boolean,
@@ -580,18 +751,14 @@ export class JanusClient extends EventEmitter {
     description = 'some event',
   ): Promise<any> {
     return new Promise((resolve, reject) => {
-      const waiter = {
-        predicate,
-        resolve,
-        reject,
-      };
+      const waiter = { predicate, resolve, reject };
       this.eventWaiters.push(waiter);
 
       setTimeout(() => {
         const idx = this.eventWaiters.indexOf(waiter);
         if (idx !== -1) {
           this.eventWaiters.splice(idx, 1);
-          console.log(
+          this.logger.warn(
             `[JanusClient] waitForJanusEvent => timed out waiting for: ${description}`,
           );
           reject(
@@ -604,13 +771,16 @@ export class JanusClient extends EventEmitter {
     });
   }
 
+  /**
+   * Destroys the Janus room (host only). Does not close local PC or stop polling.
+   */
   public async destroyRoom(): Promise<void> {
     if (!this.sessionId || !this.handleId) {
-      console.warn('[JanusClient] destroyRoom => no session/handle');
+      this.logger.warn('[JanusClient] destroyRoom => no session/handle');
       return;
     }
     if (!this.config.roomId || !this.config.userId) {
-      console.warn('[JanusClient] destroyRoom => no roomId/userId');
+      this.logger.warn('[JanusClient] destroyRoom => no roomId/userId');
       return;
     }
 
@@ -620,8 +790,8 @@ export class JanusClient extends EventEmitter {
       room: this.config.roomId,
       periscope_user_id: this.config.userId,
     };
+    this.logger.info('[JanusClient] destroying room =>', body);
 
-    console.log('[JanusClient] destroying room =>', body);
     const resp = await fetch(
       `${this.config.webrtcUrl}/${this.sessionId}/${this.handleId}`,
       {
@@ -638,18 +808,19 @@ export class JanusClient extends EventEmitter {
         }),
       },
     );
-
     if (!resp.ok) {
       throw new Error(`[JanusClient] destroyRoom failed => ${resp.status}`);
     }
-
     const json = await resp.json();
-    console.log('[JanusClient] destroyRoom =>', JSON.stringify(json));
+    this.logger.debug('[JanusClient] destroyRoom =>', JSON.stringify(json));
   }
 
+  /**
+   * Leaves the Janus room if we've joined. Does not close the local PC or stop polling.
+   */
   public async leaveRoom(): Promise<void> {
     if (!this.sessionId || !this.handleId) {
-      console.warn('[JanusClient] leaveRoom => no session/handle');
+      this.logger.warn('[JanusClient] leaveRoom => no session/handle');
       return;
     }
     const transaction = this.randomTid();
@@ -658,8 +829,8 @@ export class JanusClient extends EventEmitter {
       room: this.config.roomId,
       periscope_user_id: this.config.userId,
     };
+    this.logger.info('[JanusClient] leaving room =>', body);
 
-    console.log('[JanusClient] leaving room =>', body);
     const resp = await fetch(
       `${this.config.webrtcUrl}/${this.sessionId}/${this.handleId}`,
       {
@@ -679,6 +850,6 @@ export class JanusClient extends EventEmitter {
       throw new Error(`[JanusClient] leaveRoom => error code ${resp.status}`);
     }
     const json = await resp.json();
-    console.log('[JanusClient] leaveRoom =>', JSON.stringify(json));
+    this.logger.debug('[JanusClient] leaveRoom =>', JSON.stringify(json));
   }
 }

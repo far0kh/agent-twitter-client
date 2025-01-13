@@ -9,6 +9,8 @@ import {
   parseTimelineEntryItemContentRaw,
   ThreadedConversation,
   parseThreadedConversation,
+  parseArticle,
+  TimelineArticle,
 } from './timeline-v2';
 import { getTweetTimeline } from './timeline-async';
 import { apiRequestFactory } from './api-data';
@@ -444,6 +446,7 @@ export async function createCreateTweetRequest(
   auth: TwitterAuth,
   tweetId?: string,
   mediaData?: { data: Buffer; mediaType: string }[],
+  hideLinkPreview = false,
 ) {
   const onboardingTaskUrl = 'https://api.twitter.com/1.1/onboarding/task.json';
 
@@ -473,6 +476,10 @@ export async function createCreateTweetRequest(
     },
     semantic_annotation_ids: [],
   };
+
+  if (hideLinkPreview) {
+    variables["card_uri"] = "tombstone://card"
+  }
 
   if (mediaData && mediaData.length > 0) {
     const mediaIds = await Promise.all(
@@ -1478,4 +1485,29 @@ export async function createCreateLongTweetRequest(
   }
 
   return response;
+}
+
+export async function getArticle(
+  id: string,
+  auth: TwitterAuth,
+): Promise<TimelineArticle | null> {
+  const tweetDetailRequest =
+    apiRequestFactory.createTweetDetailArticleRequest();
+  tweetDetailRequest.variables.focalTweetId = id;
+
+  const res = await requestApi<ThreadedConversation>(
+    tweetDetailRequest.toRequestUrl(),
+    auth,
+  );
+
+  if (!res.success) {
+    throw res.err;
+  }
+
+  if (!res.value) {
+    return null;
+  }
+
+  const articles = parseArticle(res.value);
+  return articles.find((article) => article.id === id) ?? null;
 }

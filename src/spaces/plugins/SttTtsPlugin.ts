@@ -3,78 +3,127 @@
 import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
-import { Plugin, AudioDataWithUser } from '../types';
+import { AudioDataWithUser, Plugin } from '../types';
 import { Space } from '../core/Space';
+import { SpaceParticipant } from '../core/SpaceParticipant';
 import { JanusClient } from '../core/JanusClient';
+import { Logger } from '../logger';
 
 interface PluginConfig {
   openAiApiKey?: string; // for STT & ChatGPT
   elevenLabsApiKey?: string; // for TTS
-  sttLanguage?: string; // e.g. "en" for Whisper
-  gptModel?: string; // e.g. "gpt-3.5-turbo"
+  sttLanguage?: string; // e.g., "en" for Whisper
+  gptModel?: string; // e.g., "gpt-3.5-turbo" or "gpt-4"
   silenceThreshold?: number; // amplitude threshold for ignoring silence
   voiceId?: string; // specify which ElevenLabs voice to use
-  elevenLabsModel?: string; // e.g. "eleven_monolingual_v1"
-  systemPrompt?: string; // ex. "You are a helpful AI assistant"
+  elevenLabsModel?: string; // e.g., "eleven_monolingual_v1"
+  systemPrompt?: string; // e.g., "You are a helpful AI assistant"
   chatContext?: Array<{
     role: 'system' | 'user' | 'assistant';
     content: string;
   }>;
+  debug?: boolean;
 }
 
 /**
- * MVP plugin for speech-to-text (OpenAI) + conversation + TTS (ElevenLabs)
- * Approach:
- *   - Collect each speaker's unmuted PCM in a memory buffer (only if above silence threshold)
- *   - On speaker mute -> flush STT -> GPT -> TTS -> push to Janus
+ * SttTtsPlugin
+ * ------------
+ * Provides an end-to-end flow of:
+ *  - Speech-to-Text (OpenAI Whisper)
+ *  - ChatGPT conversation
+ *  - Text-to-Speech (ElevenLabs)
+ *  - Streams TTS audio frames back to Janus
+ *
+ * Lifecycle:
+ *  - onAttach(...) => minimal references
+ *  - init(...) => space or participant has joined in basic mode
+ *  - onJanusReady(...) => we have a JanusClient
+ *  - onAudioData(...) => receiving PCM frames from speakers
+ *  - cleanup(...) => release resources, stop timers, etc.
  */
 export class SttTtsPlugin implements Plugin {
-  private space?: Space;
+  // References to the space/participant and the Janus client
+  private spaceOrParticipant?: Space | SpaceParticipant;
   private janus?: JanusClient;
 
-  // OpenAI + ElevenLabs
+  // Optional logger retrieved from the space or participant
+  private logger?: Logger;
+
+  // Credentials & config
   private openAiApiKey?: string;
   private elevenLabsApiKey?: string;
+  private sttLanguage: string = 'en';
+  private gptModel: string = 'gpt-3.5-turbo';
+  private voiceId: string = '21m00Tcm4TlvDq8ikWAM';
+  private elevenLabsModel: string = 'eleven_monolingual_v1';
+  private systemPrompt: string = 'You are a helpful AI assistant.';
+  private silenceThreshold: number = 50;
 
-  private sttLanguage = 'en';
-  private gptModel = 'gpt-3.5-turbo';
-  private voiceId = '21m00Tcm4TlvDq8ikWAM';
-  private elevenLabsModel = 'eleven_monolingual_v1';
-
-  private systemPrompt = 'You are a helpful AI assistant.';
+  /**
+   * chatContext accumulates the conversation for GPT:
+   *  - system: persona instructions
+   *  - user/assistant: running conversation
+   */
   private chatContext: Array<{
     role: 'system' | 'user' | 'assistant';
     content: string;
   }> = [];
 
   /**
-   * userId => arrayOfChunks (PCM Int16)
+   * Maps each userId => array of Int16Array PCM chunks
+   * Only accumulates data if the speaker is unmuted
    */
   private pcmBuffers = new Map<string, Int16Array[]>();
 
   /**
-   * Track mute states: userId => boolean (true=unmuted)
+   * Tracks which speakers are currently unmuted:
+   * userId => true/false
    */
   private speakerUnmuted = new Map<string, boolean>();
 
   /**
-   * For ignoring near-silence frames (if amplitude < threshold)
+   * TTS queue for sequential playback
    */
-  private silenceThreshold = 50; // default amplitude threshold
+  private ttsQueue: string[] = [];
+  private isSpeaking: boolean = false;
 
-  onAttach(space: Space) {
-    console.log('[SttTtsPlugin] onAttach => space was attached');
+  /**
+   * Called immediately after `.use(plugin)`.
+   * Usually used for storing references or minimal setup.
+   */
+  onAttach(params: {
+    space: Space | SpaceParticipant;
+    pluginConfig?: Record<string, any>;
+  }): void {
+    // Store a reference to the space or participant
+    this.spaceOrParticipant = params.space;
+
+    const debugEnabled = params.pluginConfig?.debug ?? false;
+    this.logger = new Logger(debugEnabled);
+
+    console.log('[SttTtsPlugin] onAttach => plugin attached');
   }
 
-  init(params: { space: Space; pluginConfig?: Record<string, any> }): void {
-    console.log(
-      '[SttTtsPlugin] init => Space fully ready. Subscribing to events.',
-    );
-
-    this.space = params.space;
-    this.janus = (this.space as any)?.janusClient as JanusClient | undefined;
-
+  /**
+   * Called after the space/participant has joined in basic mode (listener + chat).
+   * This is where we can finalize setup that doesn't require Janus or speaker mode.
+   */
+  init(params: {
+    space: Space | SpaceParticipant;
+    pluginConfig?: Record<string, any>;
+  }): void {
     const config = params.pluginConfig as PluginConfig;
+
+    this.logger?.debug('[SttTtsPlugin] init => finalizing basic setup');
+
+    // Overwrite the local reference with a strong typed one
+    this.spaceOrParticipant = params.space;
+
+    // If space/participant has a Janus client already, we can store it,
+    // but typically we rely on "onJanusReady" for that.
+    this.janus = (this.spaceOrParticipant as any).janusClient;
+
+    // Merge plugin configuration
     this.openAiApiKey = config?.openAiApiKey;
     this.elevenLabsApiKey = config?.elevenLabsApiKey;
     if (config?.sttLanguage) this.sttLanguage = config.sttLanguage;
@@ -82,33 +131,27 @@ export class SttTtsPlugin implements Plugin {
     if (typeof config?.silenceThreshold === 'number') {
       this.silenceThreshold = config.silenceThreshold;
     }
-    if (config?.voiceId) {
-      this.voiceId = config.voiceId;
-    }
-    if (config?.elevenLabsModel) {
-      this.voiceId = config.elevenLabsModel;
-    }
-
-    if (config.systemPrompt) {
-      this.systemPrompt = config.systemPrompt;
-    }
-    if (config.chatContext) {
+    if (config?.voiceId) this.voiceId = config.voiceId;
+    if (config?.elevenLabsModel) this.elevenLabsModel = config.elevenLabsModel;
+    if (config?.systemPrompt) this.systemPrompt = config.systemPrompt;
+    if (config?.chatContext) {
       this.chatContext = config.chatContext;
     }
-    console.log('[SttTtsPlugin] Plugin config =>', config);
 
-    // Listen for mute state changes to trigger STT flush
-    this.space.on(
+    this.logger?.debug('[SttTtsPlugin] Merged config =>', config);
+
+    // Example: watch for "muteStateChanged" events from the space or participant
+    this.spaceOrParticipant.on(
       'muteStateChanged',
       (evt: { userId: string; muted: boolean }) => {
-        console.log('[SttTtsPlugin] Speaker muteStateChanged =>', evt);
+        this.logger?.debug('[SttTtsPlugin] muteStateChanged =>', evt);
         if (evt.muted) {
-          // speaker just got muted => flush STT
-          this.handleMute(evt.userId).catch((err) =>
-            console.error('[SttTtsPlugin] handleMute error =>', err),
-          );
+          // If the user just muted, flush STT
+          this.handleMute(evt.userId).catch((err) => {
+            this.logger?.error('[SttTtsPlugin] handleMute error =>', err);
+          });
         } else {
-          // unmuted => start buffering
+          // Mark user as unmuted
           this.speakerUnmuted.set(evt.userId, true);
           if (!this.pcmBuffers.has(evt.userId)) {
             this.pcmBuffers.set(evt.userId, []);
@@ -119,49 +162,59 @@ export class SttTtsPlugin implements Plugin {
   }
 
   /**
-   * Called whenever we receive PCM from a speaker
+   * Called if/when the plugin needs direct access to a JanusClient.
+   * For example, once the participant becomes a speaker or if a host
+   * has finished setting up Janus.
    */
-  onAudioData(data: AudioDataWithUser): void {
-    // Skip if speaker is muted or not tracked
-    if (!this.speakerUnmuted.get(data.userId)) return;
-
-    // Optional: detect silence
-    let maxVal = 0;
-    for (let i = 0; i < data.samples.length; i++) {
-      const val = Math.abs(data.samples[i]);
-      if (val > maxVal) maxVal = val;
-    }
-    if (maxVal < this.silenceThreshold) {
-      // It's near-silence => skip
-      return;
-    }
-
-    // Add chunk
-    let arr = this.pcmBuffers.get(data.userId);
-    if (!arr) {
-      arr = [];
-      this.pcmBuffers.set(data.userId, arr);
-    }
-    arr.push(data.samples);
+  onJanusReady(janusClient: JanusClient): void {
+    this.logger?.debug(
+      '[SttTtsPlugin] onJanusReady => JanusClient is now available',
+    );
+    this.janus = janusClient;
   }
 
   /**
-   * On speaker mute => flush STT => GPT => TTS => push to Janus
+   * onAudioData: triggered for every incoming PCM frame from a speaker.
+   * We'll accumulate them if that speaker is currently unmuted.
+   */
+  onAudioData(data: AudioDataWithUser): void {
+    const { userId, samples } = data;
+    if (!this.speakerUnmuted.get(userId)) return;
+
+    // Basic amplitude check
+    let maxVal = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const val = Math.abs(samples[i]);
+      if (val > maxVal) maxVal = val;
+    }
+    if (maxVal < this.silenceThreshold) return;
+
+    // Accumulate frames
+    const chunks = this.pcmBuffers.get(userId) ?? [];
+    chunks.push(samples);
+    this.pcmBuffers.set(userId, chunks);
+  }
+
+  /**
+   * handleMute: called when a speaker goes from unmuted to muted.
+   * We'll flush their collected PCM => STT => GPT => TTS => push to Janus
    */
   private async handleMute(userId: string): Promise<void> {
     this.speakerUnmuted.set(userId, false);
+
     const chunks = this.pcmBuffers.get(userId) || [];
     this.pcmBuffers.set(userId, []); // reset
 
     if (!chunks.length) {
-      console.log('[SttTtsPlugin] No audio chunks for user =>', userId);
+      this.logger?.debug('[SttTtsPlugin] No audio data => userId=', userId);
       return;
     }
-    console.log(
-      `[SttTtsPlugin] Flushing STT buffer for user=${userId}, total chunks=${chunks.length}`,
+
+    this.logger?.info(
+      `[SttTtsPlugin] Flushing STT buffer => userId=${userId}, chunkCount=${chunks.length}`,
     );
 
-    // 1) Merge chunks
+    // Merge into one Int16Array
     const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
     const merged = new Int16Array(totalLen);
     let offset = 0;
@@ -170,43 +223,69 @@ export class SttTtsPlugin implements Plugin {
       offset += c.length;
     }
 
-    // 2) Convert PCM -> WAV (48kHz) for STT
+    // Convert to WAV
     const wavPath = await this.convertPcmToWav(merged, 48000);
-    console.log('[SttTtsPlugin] WAV ready =>', wavPath);
+    this.logger?.debug('[SttTtsPlugin] WAV created =>', wavPath);
 
-    // 3) STT with OpenAI Whisper
+    // Whisper STT
     const sttText = await this.transcribeWithOpenAI(wavPath, this.sttLanguage);
-    fs.unlinkSync(wavPath);
+    fs.unlinkSync(wavPath); // remove temp
+
     if (!sttText.trim()) {
-      console.log('[SttTtsPlugin] No speech recognized for user =>', userId);
+      this.logger?.debug(
+        '[SttTtsPlugin] No speech recognized => userId=',
+        userId,
+      );
       return;
     }
-    console.log(`[SttTtsPlugin] STT => user=${userId}, text="${sttText}"`);
-
-    // 4) GPT
-    const replyText = await this.askChatGPT(sttText);
-    console.log(`[SttTtsPlugin] GPT => user=${userId}, reply="${replyText}"`);
-
-    // 5) TTS => returns MP3
-    const ttsAudio = await this.elevenLabsTts(replyText);
-    console.log('[SttTtsPlugin] TTS => got MP3 size=', ttsAudio.length);
-
-    // 6) Convert MP3 -> PCM (48kHz, mono)
-    const pcm = await this.convertMp3ToPcm(ttsAudio, 48000);
-    console.log(
-      '[SttTtsPlugin] TTS => converted to PCM => frames=',
-      pcm.length,
+    this.logger?.info(
+      `[SttTtsPlugin] STT => userId=${userId}, text="${sttText}"`,
     );
 
-    // 7) Push frames to Janus
-    if (this.janus) {
-      await this.streamToJanus(pcm, 48000);
-      console.log('[SttTtsPlugin] TTS => done streaming to space');
+    // GPT response
+    const replyText = await this.askChatGPT(sttText);
+    this.logger?.info(
+      `[SttTtsPlugin] GPT => userId=${userId}, reply="${replyText}"`,
+    );
+
+    // Send TTS
+    await this.speakText(replyText);
+  }
+
+  /**
+   * speakText: Public method to enqueue a text message for TTS output
+   */
+  public async speakText(text: string): Promise<void> {
+    this.ttsQueue.push(text);
+
+    if (!this.isSpeaking) {
+      this.isSpeaking = true;
+      this.processTtsQueue().catch((err) => {
+        this.logger?.error('[SttTtsPlugin] processTtsQueue error =>', err);
+      });
     }
   }
 
   /**
-   * Convert Int16 PCM -> WAV using ffmpeg
+   * processTtsQueue: Drains the TTS queue in order, sending frames to Janus
+   */
+  private async processTtsQueue(): Promise<void> {
+    while (this.ttsQueue.length > 0) {
+      const text = this.ttsQueue.shift();
+      if (!text) continue;
+      try {
+        const mp3Buf = await this.elevenLabsTts(text);
+        const pcm = await this.convertMp3ToPcm(mp3Buf, 48000);
+        await this.streamToJanus(pcm, 48000);
+      } catch (err) {
+        this.logger?.error('[SttTtsPlugin] TTS streaming error =>', err);
+      }
+    }
+    this.isSpeaking = false;
+  }
+
+  /**
+   * convertPcmToWav: Creates a temporary WAV file from raw PCM samples
    */
   private convertPcmToWav(
     samples: Int16Array,
@@ -226,100 +305,79 @@ export class SttTtsPlugin implements Plugin {
         '-y',
         tmpPath,
       ]);
+
       ff.stdin.write(Buffer.from(samples.buffer));
       ff.stdin.end();
+
       ff.on('close', (code) => {
-        if (code === 0) resolve(tmpPath);
-        else reject(new Error(`ffmpeg error code=${code}`));
+        if (code === 0) {
+          resolve(tmpPath);
+        } else {
+          reject(new Error(`ffmpeg pcm->wav error code=${code}`));
+        }
       });
     });
   }
 
   /**
-   * OpenAI Whisper STT
+   * transcribeWithOpenAI: sends the WAV file to OpenAI Whisper
    */
-  private async transcribeWithOpenAI(wavPath: string, language: string) {
+  private async transcribeWithOpenAI(
+    wavPath: string,
+    language: string,
+  ): Promise<string> {
     if (!this.openAiApiKey) {
-      throw new Error('[SttTtsPlugin] No OpenAI API key available');
+      throw new Error('[SttTtsPlugin] No OpenAI API key');
     }
 
-    try {
-      console.log('[SttTtsPlugin] Transcribe =>', wavPath);
+    this.logger?.info('[SttTtsPlugin] Transcribing =>', wavPath);
+    const fileBuffer = fs.readFileSync(wavPath);
+    this.logger?.debug('[SttTtsPlugin] WAV size =>', fileBuffer.length);
 
-      // Read file into buffer
-      const fileBuffer = fs.readFileSync(wavPath);
-      console.log(
-        '[SttTtsPlugin] File read, size:',
-        fileBuffer.length,
-        'bytes',
-      );
+    const blob = new Blob([fileBuffer], { type: 'audio/wav' });
+    const formData = new FormData();
+    formData.append('file', blob, path.basename(wavPath));
+    formData.append('model', 'whisper-1');
+    formData.append('language', language);
+    formData.append('temperature', '0');
 
-      // Create blob from buffer
-      const blob = new Blob([fileBuffer], { type: 'audio/wav' });
+    const resp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.openAiApiKey}` },
+      body: formData,
+    });
 
-      // Create FormData
-      const formData = new FormData();
-      formData.append('file', blob, path.basename(wavPath));
-      formData.append('model', 'whisper-1');
-      formData.append('language', language);
-      formData.append('temperature', '0');
-
-      // Call OpenAI API
-      const response = await fetch(
-        'https://api.openai.com/v1/audio/transcriptions',
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${this.openAiApiKey}`,
-          },
-          body: formData,
-        },
-      );
-
-      // Handle errors
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('[SttTtsPlugin] API Error:', errorText);
-        throw new Error(`OpenAI API error: ${response.status} ${errorText}`);
-      }
-
-      // Parse response
-      const data = (await response.json()) as { text: string };
-      const text = data.text?.trim() || '';
-      console.log('[SttTtsPlugin] Transcription =>', text);
-      return text;
-    } catch (err) {
-      console.error('[SttTtsPlugin] OpenAI STT Error =>', err);
-      throw new Error('OpenAI STT failed');
+    if (!resp.ok) {
+      const errText = await resp.text();
+      this.logger?.error('[SttTtsPlugin] OpenAI STT error =>', errText);
+      throw new Error(`OpenAI STT => ${resp.status} ${errText}`);
     }
+
+    const data = (await resp.json()) as { text: string };
+    return data.text.trim();
   }
 
   /**
-   * Simple ChatGPT call
+   * askChatGPT: sends user text to GPT, returns the assistant reply
    */
   private async askChatGPT(userText: string): Promise<string> {
     if (!this.openAiApiKey) {
-      throw new Error('[SttTtsPlugin] No OpenAI API key for ChatGPT');
+      throw new Error('[SttTtsPlugin] No OpenAI API key (GPT) provided');
     }
-    const url = 'https://api.openai.com/v1/chat/completions';
 
-    // Build the final array of messages
     const messages = [
       { role: 'system', content: this.systemPrompt },
       ...this.chatContext,
       { role: 'user', content: userText },
     ];
 
-    const resp = await fetch(url, {
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.openAiApiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: this.gptModel,
-        messages,
-      }),
+      body: JSON.stringify({ model: this.gptModel, messages }),
     });
 
     if (!resp.ok) {
@@ -331,21 +389,20 @@ export class SttTtsPlugin implements Plugin {
 
     const json = await resp.json();
     const reply = json.choices?.[0]?.message?.content || '';
-
-    // Optionally store the conversation in the chatContext
+    // Keep conversation context
     this.chatContext.push({ role: 'user', content: userText });
     this.chatContext.push({ role: 'assistant', content: reply });
-
     return reply.trim();
   }
 
   /**
-   * ElevenLabs TTS => returns MP3 Buffer
+   * elevenLabsTts: fetches MP3 audio from ElevenLabs for a given text
    */
   private async elevenLabsTts(text: string): Promise<Buffer> {
     if (!this.elevenLabsApiKey) {
       throw new Error('[SttTtsPlugin] No ElevenLabs API key');
     }
+
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}`;
     const resp = await fetch(url, {
       method: 'POST',
@@ -359,18 +416,20 @@ export class SttTtsPlugin implements Plugin {
         voice_settings: { stability: 0.4, similarity_boost: 0.8 },
       }),
     });
+
     if (!resp.ok) {
       const errText = await resp.text();
       throw new Error(
-        `[SttTtsPlugin] ElevenLabs TTS error => ${resp.status} ${errText}`,
+        `[SttTtsPlugin] ElevenLabs error => ${resp.status} ${errText}`,
       );
     }
-    const arrayBuf = await resp.arrayBuffer();
-    return Buffer.from(arrayBuf);
+
+    const arrayBuffer = await resp.arrayBuffer();
+    return Buffer.from(arrayBuffer);
   }
 
   /**
-   * Convert MP3 => PCM via ffmpeg
+   * convertMp3ToPcm: uses ffmpeg to convert an MP3 buffer to raw PCM
    */
   private convertMp3ToPcm(
     mp3Buf: Buffer,
@@ -388,16 +447,18 @@ export class SttTtsPlugin implements Plugin {
         '1',
         'pipe:1',
       ]);
+
       let raw = Buffer.alloc(0);
+
       ff.stdout.on('data', (chunk: Buffer) => {
         raw = Buffer.concat([raw, chunk]);
       });
       ff.stderr.on('data', () => {
-        /* ignore ffmpeg logs */
+        // ignoring ffmpeg stderr
       });
       ff.on('close', (code) => {
         if (code !== 0) {
-          reject(new Error(`ffmpeg error code=${code}`));
+          reject(new Error(`ffmpeg mp3->pcm error code=${code}`));
           return;
         }
         const samples = new Int16Array(
@@ -407,88 +468,86 @@ export class SttTtsPlugin implements Plugin {
         );
         resolve(samples);
       });
+
       ff.stdin.write(mp3Buf);
       ff.stdin.end();
     });
   }
 
   /**
-   * Push PCM back to Janus in small frames
-   * We'll do 10ms @48k => 960 samples per frame
+   * streamToJanus: push PCM frames to Janus in small increments (~10ms).
    */
   private async streamToJanus(
     samples: Int16Array,
     sampleRate: number,
   ): Promise<void> {
-    // 10 ms => 480 samples @48k
-    const FRAME_SIZE = 480;
+    if (!this.janus) {
+      this.logger?.warn(
+        '[SttTtsPlugin] No JanusClient available, cannot send TTS audio',
+      );
+      return;
+    }
+
+    const frameSize = Math.floor(sampleRate * 0.01); // 10ms => e.g. 480 @ 48kHz
 
     for (
       let offset = 0;
-      offset + FRAME_SIZE <= samples.length;
-      offset += FRAME_SIZE
+      offset + frameSize <= samples.length;
+      offset += frameSize
     ) {
-      // Option 1: subarray + .set
-      const frame = new Int16Array(FRAME_SIZE);
-      frame.set(samples.subarray(offset, offset + FRAME_SIZE));
-
-      this.janus?.pushLocalAudio(frame, sampleRate, 1);
+      const frame = new Int16Array(frameSize);
+      frame.set(samples.subarray(offset, offset + frameSize));
+      this.janus.pushLocalAudio(frame, sampleRate, 1);
       await new Promise((r) => setTimeout(r, 10));
     }
   }
 
-  public async speakText(text: string): Promise<void> {
-    // 1) TTS => MP3
-    const ttsAudio = await this.elevenLabsTts(text);
-
-    // 2) Convert MP3 -> PCM
-    const pcm = await this.convertMp3ToPcm(ttsAudio, 48000);
-
-    // 3) Stream to Janus
-    if (this.janus) {
-      await this.streamToJanus(pcm, 48000);
-      console.log('[SttTtsPlugin] speakText => done streaming to space');
-    }
-  }
-
   /**
-   * Change the system prompt at runtime.
+   * setSystemPrompt: update the GPT system prompt at runtime
    */
-  public setSystemPrompt(prompt: string) {
+  public setSystemPrompt(prompt: string): void {
     this.systemPrompt = prompt;
-    console.log('[SttTtsPlugin] setSystemPrompt =>', prompt);
+    this.logger?.info('[SttTtsPlugin] setSystemPrompt =>', prompt);
   }
 
   /**
-   * Change the GPT model at runtime (e.g. "gpt-4", "gpt-3.5-turbo", etc.).
+   * setGptModel: switch GPT model (e.g. "gpt-4")
    */
-  public setGptModel(model: string) {
+  public setGptModel(model: string): void {
     this.gptModel = model;
-    console.log('[SttTtsPlugin] setGptModel =>', model);
+    this.logger?.info('[SttTtsPlugin] setGptModel =>', model);
   }
 
   /**
-   * Add a message (system, user or assistant) to the chat context.
-   * E.g. to store conversation history or inject a persona.
+   * addMessage: manually add a system/user/assistant message to the chat context
    */
-  public addMessage(role: 'system' | 'user' | 'assistant', content: string) {
+  public addMessage(
+    role: 'system' | 'user' | 'assistant',
+    content: string,
+  ): void {
     this.chatContext.push({ role, content });
-    console.log(
-      `[SttTtsPlugin] addMessage => role=${role}, content=${content}`,
+    this.logger?.debug(
+      `[SttTtsPlugin] addMessage => role=${role}, content="${content}"`,
     );
   }
 
   /**
-   * Clear the chat context if needed.
+   * clearChatContext: resets the GPT conversation
    */
-  public clearChatContext() {
+  public clearChatContext(): void {
     this.chatContext = [];
-    console.log('[SttTtsPlugin] clearChatContext => done');
+    this.logger?.debug('[SttTtsPlugin] clearChatContext => done');
   }
 
+  /**
+   * cleanup: release resources when the space/participant is stopping or plugin removed
+   */
   cleanup(): void {
-    console.log('[SttTtsPlugin] cleanup => releasing resources');
+    this.logger?.info('[SttTtsPlugin] cleanup => releasing resources');
+
     this.pcmBuffers.clear();
     this.speakerUnmuted.clear();
+    this.ttsQueue = [];
+    this.isSpeaking = false;
   }
 }
